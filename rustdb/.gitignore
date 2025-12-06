@@ -1,0 +1,7 @@
+# Generated files
+/target
+# Generated student crates
+/student
+
+# Apple metadata files
+**/.DS_Store

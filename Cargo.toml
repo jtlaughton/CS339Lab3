@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+]
+exclude = [
+    "target/",
+]
+
+[workspace.package]
+rust-version = "1.83"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/nu-db/rustdb"
+repository = "https://github.com/nu-db/rustdb"
+
+[workspace.dependencies]
+rand = "0.9.0"
+serde = { version = "1.0.204", features = ["derive"] }
+bytes = "1.9.0"
+serial_test = "3.2.0"
+tokio = { version = "1.42.0", features = ["sync"] }
+
+[workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
+
+[workspace.lints.clippy]
+all = { level = "allow", priority = -2 }
+correctness = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+disallowed_methods = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+self_named_module_files = "warn"
+
+[package]
+name = "rustdb-dev"
+version = "0.1.0"
+edition = "2021"
+#edition.workspace = true
+#license.workspace = true
+rust-version = "1.83"
+repository.workspace = true
+# homepage = TODO
+# documentation = "https://docs.rs/TODO"
+description = """
+Rustdb, a pedagogical database management system.
+"""
+
+[lib]
+name = "rustdb"
+path = "src/rustdb/lib.rs"
+
+[dev-dependencies]
+
+[build-dependencies]
+
+[lints]
+workspace = true

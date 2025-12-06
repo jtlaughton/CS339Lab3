@@ -1,0 +1,24 @@
+[package]
+name = "rustdb-storage"
+version = "0.2.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+# documentation = "https://docs.rs/rustdb-storage"
+description = "The storage engine for the Rustdb pedagogical database management system."
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+serial_test.workspace = true
+rustdb-error = { path = "../error" }
+rustdb-catalog = { path = "../catalog" }
+bytemuck = { version = "*", features = ["derive"] }
+fs2 = "0.4.3"
+rand.workspace = true
+
+[lints]
+workspace = true
