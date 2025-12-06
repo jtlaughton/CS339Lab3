@@ -340,7 +340,18 @@ impl BPlusTreeIndexImpl {
     ) -> Result<()> {
         // If the current leaf is the root, no rebalancing is needed.
         if context.root_page_id == Some(internal_page.page_id()) {
-            return Ok(());
+            if internal_page.size() == 1 {
+                let new_root_pid = internal_page.pid_array()[0];
+                let old_root_pid = internal_page.page_id();
+                context.meta_page.unwrap().set_root_page_id(new_root_pid);
+
+                // Drop the internal_page handle before attempting to delete it
+                drop(internal_page);
+
+                self.bpm.write().unwrap().delete_page(old_root_pid)?;
+            }
+
+            return Ok(())
         }
         // Invariant: if this leaf is not the root, it must have a parent internal page in the write set.
         assert!(context.write_set.len() > 0);
@@ -374,31 +385,94 @@ impl BPlusTreeIndexImpl {
         };
         // The key index in the parent internal page that corresponds to the right leaf page
         let right_most_key_index = if is_right_most { index } else { index + 1 };
-        let middle_key = parent_page.key_array()[right_most_key_index];
+        let right_most_key = parent_page.key_array()[right_most_key_index];
 
         // Check if both leaves can fit in one page (merge case)
-        if left.size() + right.size() <= left.max_size() - 1 {
-            right.move_all_to(&mut left, &middle_key);
-            parent_page.remove_at(right_most_key_index)?;
-            self.bpm.write().unwrap().delete_page(right.page_id())?;
+        // 1. Coalesces (merges) the leaf with a sibling if their combined size fits in one page.
+        //    - The parent entry for the removed sibling is deleted.
+        //    - The sibling's page is marked for deletion.
+        //    - If the parent becomes underfull as a result, recursively re-balance the parent.
+        let left_size = left.size();
+        let right_size = right.size();
+        let left_max = left.max_size();
 
-            if context.root_page_id != Some(parent_page.page_id())
-                && parent_page.size() < parent_page.min_size() {
+        if left_size + right_size <= left_max {
+            // apparently must always move right to left
+            let pid_delete = right.page_id();
+            right.move_all_to(&mut left, &right_most_key);
+
+            // Drop the page handles before attempting to delete the page
+            drop(left);
+            drop(right);
+
+            self.bpm.write().unwrap().delete_page(pid_delete)?;
+            parent_page.remove_at(right_most_key_index)?;
+
+            let parent_size = parent_page.size();
+            let parent_min_size = parent_page.min_size();
+
+            if parent_size < parent_min_size {
                 self.coalesce_or_redistribute_internal(context, parent_page)?;
             }
-            else if parent_page.size() == 1{
-                context.meta_page.unwrap().set_root_page_id(left.page_id());
-                self.bpm.write().unwrap().delete_page(parent_page.page_id())?;
-            }
-        } else {
-            if is_right_most {
-                left.move_last_to_front_of(&mut right, &middle_key);
-            }
-            else {
-                right.move_first_to_end_of(&mut left, &middle_key);
-            }
+        }
+        // 2. Redistributes entries between siblings if merging is not possible.
+        //    - Moves one or more entries from a sibling to balance both pages.
+        //    - Updates the parent key to reflect the new split boundary.
+        else {
+            // Redistribution case for INTERNAL pages
+            // honestly can't get the helpers to work so I adjusted the logic to a way that
+            // makes more sense to me
 
-            parent_page.key_array_mut()[right_most_key_index] = right.key_array()[0];
+            if is_right_most {
+                // Right page wants to borrow from the left
+                let last_pid = left.pid_array()[left.size() - 1];
+                let new_parent_key = left.key_array()[left.size() - 1];
+
+                // Shift right's entries to make room
+                let right_size = right.size();
+                // Shift pids: [P0, P1, ...] -> [?, P0, P1, ...]
+                for i in (0..right_size).rev() {
+                    right.pid_array_mut()[i + 1] = right.pid_array()[i];
+                }
+                // Shift keys: [invalid, K1, K2, ...] -> [invalid, ?, K1, K2, ...]
+                for i in (1..right_size).rev() {
+                    right.key_array_mut()[i + 1] = right.key_array()[i];
+                }
+
+                right.key_array_mut()[1] = right_most_key;
+                right.pid_array_mut()[0] = last_pid;
+
+                right.set_size(right_size + 1);
+                left.set_size(left.size() - 1);
+
+                // Update parent separator to be the last key from left
+                parent_page.key_array_mut()[right_most_key_index] = new_parent_key;
+            }
+            // in the else case left page wants to borrow from the right
+            else {
+                // Left page wants to borrow from the right
+                let first_pid = right.pid_array()[0];
+                let new_parent_key = right.key_array()[1];
+
+                // Append middle_key and first_pid to left
+                let left_size = left.size();
+                left.key_array_mut()[left_size] = right_most_key;
+                left.pid_array_mut()[left_size] = first_pid;
+                left.set_size(left_size + 1);
+
+                // Shift right's entries left to remove the first entry
+                let right_size = right.size();
+                for i in 1..(right_size - 1) {
+                    right.key_array_mut()[i] = right.key_array()[i + 1];
+                }
+                for i in 0..(right_size - 1) {
+                    right.pid_array_mut()[i] = right.pid_array()[i + 1];
+                }
+                right.set_size(right_size - 1);
+
+                // Update parent separator to be the first key from right (before removal)
+                parent_page.key_array_mut()[right_most_key_index] = new_parent_key;
+            }
         }
         Ok(())
     }
@@ -450,12 +524,7 @@ impl BPlusTreeIndexImpl {
         let index = parent_page.find_pid_index(leaf_page.page_id()).unwrap();
         let is_right_most = index == (parent_page.size() - 1);
 
-        // If parent has only 1 child, no sibling to borrow/merge with
-        if parent_page.size() == 1 {
-            return Ok(());
-        }
-
-        // Load the leaf's left or right sibling, depending on whether it is the rightmost child.
+        // Load the leaf’s left or right sibling, depending on whether it is the rightmost child.
         let (mut left, mut right) = {
             if is_right_most {
                 let sibling_pid = parent_page.pid_array()[index - 1];
@@ -476,27 +545,43 @@ impl BPlusTreeIndexImpl {
         let right_most_key_index = if is_right_most { index } else { index + 1 };
 
         // Check if both leaves can fit in one page (merge case)
+        // 1. Coalesces (merges) the leaf with a sibling if their combined size fits in one page.
+        //    - The parent entry for the removed sibling is deleted.
+        //    - The sibling's page is marked for deletion.
+        //    - If the parent becomes underfull as a result, recursively re-balance the parent.
         if left.size() + right.size() <= left.max_size() - 1 {
+            let pid_delete = right.page_id();
             right.move_all_to(&mut left);
-            parent_page.remove_at(right_most_key_index)?;
-            self.bpm.write().unwrap().delete_page(right.page_id())?;
 
-            if context.root_page_id != Some(parent_page.page_id())
-                && parent_page.size() < parent_page.min_size() {
+            // Drop the page handles before attempting to delete the page
+            drop(left);
+            drop(right);
+
+            self.bpm.write().unwrap().delete_page(pid_delete)?;
+            parent_page.remove_at(right_most_key_index)?;
+
+            let parent_size = parent_page.size();
+            let parent_min_size = parent_page.min_size();
+
+            if parent_size < parent_min_size {
                 self.coalesce_or_redistribute_internal(context, parent_page)?;
             }
-            else if parent_page.size() == 1{
-                context.meta_page.unwrap().set_root_page_id(left.page_id());
-                self.bpm.write().unwrap().delete_page(parent_page.page_id())?;
-            }
-        } else {
+        }
+        // 2. Redistributes entries between siblings if merging is not possible.
+        //    - Moves one or more entries from a sibling to balance both pages.
+        //    - Updates the parent key to reflect the new split boundary.
+        else {
+            // Redistribution case
+            // in the right most case right page wants to borrow from the left
             if is_right_most {
                 left.move_last_to_front_of(&mut right);
             }
+            // in the else case left page wants to borrow from the right
             else {
                 right.move_first_to_end_of(&mut left);
             }
 
+            // in both cases it's the first key of the right that becomes the new parent
             parent_page.key_array_mut()[right_most_key_index] = right.key_array()[0];
         }
         Ok(())
@@ -668,7 +753,9 @@ impl BPlusTreeIndex for BPlusTreeIndexImpl {
 
         if context.root_page_id != Some(leaf_page.page_id())
             && leaf_page.size() < leaf_page.min_size() {
-            self.coalesce_or_redistribute_leaf(context, leaf_page).ok()?;
+            // do expect because it really is an error
+            self.coalesce_or_redistribute_leaf(context, leaf_page)
+                .expect("Failed to rebalance leaf after deletion");
         }
 
         Some(removed_val)
