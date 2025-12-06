@@ -10,12 +10,14 @@ use crate::{
 };
 
 /// Represents a page in the buffer pool with metadata and data storage.
+#[repr(C)]
+#[repr(align(8))]
 pub struct PageFrame {
+    data: [u8; PAGE_SIZE], // Page data storage (moved to front for alignment)
     page_id: PageId,       // Unique identifier for the page
     is_dirty: bool,        // Tracks whether the page has been modified
     pin_cnt: AtomicU16,    // Pin count indicating active users (now atomic)
     lock: RwLock<()>,      // Read-Write lock for thread safety
-    data: [u8; PAGE_SIZE], // Page data storage
 }
 
 impl fmt::Debug for PageFrame {

@@ -379,12 +379,15 @@ mod tests {
             bplus_index.validate_tree()?;
         }
 
+        bplus_index.generate_visualization("show_me_the_tree.pdf")?;
+
         let remove_keys: Vec<i64> = vec![1, 5];
 
         // Remove keys
         for &key in &remove_keys {
             let index_key = (key as u32).to_be_bytes();
             bplus_index.remove(&index_key);
+            bplus_index.generate_visualization(format!("tree_removed_{}.pdf", key).as_str())?;
             bplus_index.validate_tree()?;
         }
 

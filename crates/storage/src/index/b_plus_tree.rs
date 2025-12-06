@@ -1,9 +1,7 @@
 use rustdb_catalog::schema::RecordId;
 use rustdb_error::Result;
 use std::{
-    cmp::Ordering,
-    collections::VecDeque,
-    sync::{Arc, RwLock},
+    cmp::Ordering, collections::VecDeque, os::unix::process::parent_id, sync::{Arc, RwLock}
 };
 
 use crate::frame_handle::PageFrameMutHandle;
@@ -291,8 +289,47 @@ impl BPlusTreeIndexImpl {
         key: &BPlusTreeKey,
         old_page_pid: PageId,
         new_page_pid: PageId,
-    ) {
-todo!();
+    ) -> Result<()> {
+        if context.write_set.is_empty() {
+            let new_root_handler = BufferPoolManager::create_page_handle(&self.bpm)?;
+            let mut new_root_page = BPlusTreeInternalPageMut::from(new_root_handler);
+
+            new_root_page.init(self.internal_max_size);
+            new_root_page.set_size(2);
+            new_root_page.key_array_mut()[0] = [0u8; KEY_SIZE];
+            new_root_page.key_array_mut()[1] = *key;
+            new_root_page.pid_array_mut()[0] = old_page_pid;
+            new_root_page.pid_array_mut()[1] = new_page_pid;
+
+            match context.meta_page {
+                Some(mut meta) => meta.set_root_page_id(new_root_page.page_id()),
+                None => panic!("Expected meta to be something"),
+            };
+
+            return Ok(())
+        }
+
+        let mut parent = match context.write_set.pop_back() {
+            Some(BPlusTreePageMut::Internal(p)) => p,
+            _ => panic!("Expected internal page"),
+        };
+
+        if parent.size() < parent.max_size() {
+            parent.insert_node_after(old_page_pid, *key, new_page_pid);
+            return Ok(());
+        }
+
+        // need to create a new page
+        let new_internal_handle = BufferPoolManager::create_page_handle(&self.bpm)?;
+        let mut new_internal_page = BPlusTreeInternalPageMut::from(new_internal_handle);
+        new_internal_page.init(self.internal_max_size);
+
+        let split_key = parent.split_to_recipient_page_at(&mut new_internal_page, key, new_page_pid, self.comparator.as_ref());
+
+        let new_internal_pid = new_internal_page.page_id();
+        let parent_pid = parent.page_id();
+
+        self.insert_into_parent(context, &split_key, parent_pid, new_internal_pid)
     }
 
     /// See [`Self::coalesce_or_redistribute_leaf`]
@@ -301,7 +338,69 @@ todo!();
         mut context: BPlusTreeContext,
         internal_page: BPlusTreeInternalPageMut,
     ) -> Result<()> {
-todo!();
+        // If the current leaf is the root, no rebalancing is needed.
+        if context.root_page_id == Some(internal_page.page_id()) {
+            return Ok(());
+        }
+        // Invariant: if this leaf is not the root, it must have a parent internal page in the write set.
+        assert!(context.write_set.len() > 0);
+
+        // Pop the parent page from the write set to update it after merging or redistributing.
+        let mut parent_page = match context.write_set.pop_back() {
+            Some(BPlusTreePageMut::Internal(parent)) => parent,
+            _ => panic!("Expected an internal page but found something else"),
+        };
+
+        // Find the index of the leaf in the parent's child pointer array.
+        let index = parent_page.find_pid_index(internal_page.page_id()).unwrap();
+        let is_right_most = index == (parent_page.size() - 1);
+
+        // Load the leaf’s left or right sibling, depending on whether it is the rightmost child.
+        let (mut left, mut right) = {
+            if is_right_most {
+                let sibling_pid = parent_page.pid_array()[index - 1];
+                let sibling = BufferPoolManager::fetch_page_mut_handle(&self.bpm, sibling_pid)?;
+                let sibling_internal_page = BPlusTreeInternalPageMut::from(sibling);
+
+                (sibling_internal_page, internal_page)
+            } else {
+                let sibling_pid = parent_page.pid_array()[index + 1];
+                let sibling =
+                    BufferPoolManager::fetch_page_mut_handle(&self.bpm, sibling_pid).unwrap();
+                let sibling_internal_page = BPlusTreeInternalPageMut::from(sibling);
+
+                (internal_page, sibling_internal_page)
+            }
+        };
+        // The key index in the parent internal page that corresponds to the right leaf page
+        let right_most_key_index = if is_right_most { index } else { index + 1 };
+        let middle_key = parent_page.key_array()[right_most_key_index];
+
+        // Check if both leaves can fit in one page (merge case)
+        if left.size() + right.size() <= left.max_size() - 1 {
+            right.move_all_to(&mut left, &middle_key);
+            parent_page.remove_at(right_most_key_index)?;
+            self.bpm.write().unwrap().delete_page(right.page_id())?;
+
+            if context.root_page_id != Some(parent_page.page_id())
+                && parent_page.size() < parent_page.min_size() {
+                self.coalesce_or_redistribute_internal(context, parent_page)?;
+            }
+            else if parent_page.size() == 1{
+                context.meta_page.unwrap().set_root_page_id(left.page_id());
+                self.bpm.write().unwrap().delete_page(parent_page.page_id())?;
+            }
+        } else {
+            if is_right_most {
+                left.move_last_to_front_of(&mut right, &middle_key);
+            }
+            else {
+                right.move_first_to_end_of(&mut left, &middle_key);
+            }
+
+            parent_page.key_array_mut()[right_most_key_index] = right.key_array()[0];
+        }
+        Ok(())
     }
 
     /// Handles balancing when a leaf page becomes underfull after a deletion.
@@ -351,7 +450,12 @@ todo!();
         let index = parent_page.find_pid_index(leaf_page.page_id()).unwrap();
         let is_right_most = index == (parent_page.size() - 1);
 
-        // Load the leaf’s left or right sibling, depending on whether it is the rightmost child.
+        // If parent has only 1 child, no sibling to borrow/merge with
+        if parent_page.size() == 1 {
+            return Ok(());
+        }
+
+        // Load the leaf's left or right sibling, depending on whether it is the rightmost child.
         let (mut left, mut right) = {
             if is_right_most {
                 let sibling_pid = parent_page.pid_array()[index - 1];
@@ -373,10 +477,27 @@ todo!();
 
         // Check if both leaves can fit in one page (merge case)
         if left.size() + right.size() <= left.max_size() - 1 {
-todo!();
+            right.move_all_to(&mut left);
+            parent_page.remove_at(right_most_key_index)?;
+            self.bpm.write().unwrap().delete_page(right.page_id())?;
+
+            if context.root_page_id != Some(parent_page.page_id())
+                && parent_page.size() < parent_page.min_size() {
+                self.coalesce_or_redistribute_internal(context, parent_page)?;
+            }
+            else if parent_page.size() == 1{
+                context.meta_page.unwrap().set_root_page_id(left.page_id());
+                self.bpm.write().unwrap().delete_page(parent_page.page_id())?;
+            }
         } else {
-            // Redistribution case
-todo!();
+            if is_right_most {
+                left.move_last_to_front_of(&mut right);
+            }
+            else {
+                right.move_first_to_end_of(&mut left);
+            }
+
+            parent_page.key_array_mut()[right_most_key_index] = right.key_array()[0];
         }
         Ok(())
     }
@@ -466,7 +587,21 @@ impl BPlusTreeIndex for BPlusTreeIndexImpl {
     /// - [`BPlusTreeInternalPageRef::lookup`]
     /// - [`BPlusTreePageHeader::get_page_type_from_frame_ref`]
     fn get(&self, key: &BPlusTreeKey) -> Option<RecordId> {
-        todo!();
+        let meta_handle = BufferPoolManager::fetch_page_handle(&self.bpm, self.meta_page_id).ok()?;
+        let meta_page = BPlusTreeMetaPageRef::from(meta_handle);
+        let root_pid = meta_page.root_page_id()?;
+
+        let mut cur_handle = BufferPoolManager::fetch_page_handle(&self.bpm, root_pid).ok()?;
+
+        while BPlusTreePageHeader::get_page_type_from_frame_ref(&cur_handle) != BPlusTreePageType::LeafPage {
+            let internal_page = BPlusTreeInternalPageRef::from(cur_handle);
+            let child_pid = internal_page.lookup(key, self.comparator.as_ref());
+
+            cur_handle = BufferPoolManager::fetch_page_handle(&self.bpm, child_pid).ok()?;
+        }
+
+        let leaf_page = BPlusTreeLeafPageRef::from(cur_handle);
+        leaf_page.lookup(key, self.comparator.as_ref())
     }
 
     /// Inserts a key-value pair into the tree.
@@ -484,7 +619,35 @@ impl BPlusTreeIndex for BPlusTreeIndexImpl {
             };
         let mut leaf_page = BPlusTreeLeafPageMut::from(cur_handle);
 
-        todo!();
+        if leaf_page.size() < leaf_page.max_size() {
+            leaf_page.insert(key, val, self.comparator.as_ref())?;
+
+            return Ok(())
+        }
+
+        // now we need to split
+        let new_leaf_handle = BufferPoolManager::create_page_handle(&self.bpm)?;
+        let mut new_leaf_page = BPlusTreeLeafPageMut::from(new_leaf_handle);
+
+        let old_pid = leaf_page.page_id();
+        let new_pid = new_leaf_page.page_id();
+
+        // Split the page first (moves half the entries to new page)
+        leaf_page.move_half_to(&mut new_leaf_page, new_pid);
+
+        // Now insert into the appropriate page based on key comparison
+        if self.comparator.compare(key, &new_leaf_page.key_array()[0]) == std::cmp::Ordering::Less {
+            // Key belongs in the left (old) page
+            leaf_page.insert(key, val, self.comparator.as_ref())?;
+        } else {
+            // Key belongs in the right (new) page
+            new_leaf_page.insert(key, val, self.comparator.as_ref())?;
+        }
+
+        let promoted = new_leaf_page.key_array()[0];
+        self.insert_into_parent(context, &promoted, old_pid, new_pid)?;
+
+        Ok(())
     }
 
     /// Removes a key-value pair from the tree. If the key is found, returns the associated record
@@ -501,7 +664,14 @@ impl BPlusTreeIndex for BPlusTreeIndexImpl {
             self.traverse_down_to_leaf(key, None, FindLeafOption::Delete)?;
         let mut leaf_page = BPlusTreeLeafPageMut::from(cur_handle);
 
-        todo!();
+        let removed_val = leaf_page.remove_and_delete_record(key, self.comparator.as_ref())?;
+
+        if context.root_page_id != Some(leaf_page.page_id())
+            && leaf_page.size() < leaf_page.min_size() {
+            self.coalesce_or_redistribute_leaf(context, leaf_page).ok()?;
+        }
+
+        Some(removed_val)
     }
 
     /// Returns an iterator over key-value pairs in sorted order, bounded by optional start and end keys.
