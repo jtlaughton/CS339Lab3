@@ -136,7 +136,6 @@ impl<T: Deref<Target = PageFrame>> TablePage<T> {
             offset = safe_decrease(min.offset, tuple.tuple_size() as u16);
         }
 
-        // find where the slots would end accounting for the new slot that was added
         let tuple_cnt = self.header().tuple_cnt as usize;
         let slots_end = TABLE_PAGE_HEADER_SIZE + ((tuple_cnt + 1) * TUPLE_INFO_SIZE);
 
