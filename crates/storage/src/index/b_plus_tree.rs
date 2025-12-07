@@ -392,11 +392,8 @@ impl BPlusTreeIndexImpl {
         //    - The parent entry for the removed sibling is deleted.
         //    - The sibling's page is marked for deletion.
         //    - If the parent becomes underfull as a result, recursively re-balance the parent.
-        let left_size = left.size();
-        let right_size = right.size();
-        let left_max = left.max_size();
 
-        if left_size + right_size <= left_max {
+        if left.size() + right.size() <= left.max_size() {
             // apparently must always move right to left
             let pid_delete = right.page_id();
             right.move_all_to(&mut left, &right_most_key);
@@ -430,11 +427,11 @@ impl BPlusTreeIndexImpl {
 
                 // Shift right's entries to make room
                 let right_size = right.size();
-                // Shift pids: [P0, P1, ...] -> [?, P0, P1, ...]
+                // Shift pids
                 for i in (0..right_size).rev() {
                     right.pid_array_mut()[i + 1] = right.pid_array()[i];
                 }
-                // Shift keys: [invalid, K1, K2, ...] -> [invalid, ?, K1, K2, ...]
+                // Shift keys excluding invalid
                 for i in (1..right_size).rev() {
                     right.key_array_mut()[i + 1] = right.key_array()[i];
                 }
@@ -660,6 +657,15 @@ impl BPlusTreeIndexImpl {
         }
         Some((context, cur_handle))
     }
+
+    fn make_empty_iterator(&self, end: Option<&BPlusTreeKey>) -> BPlusTreeRangeIterator {
+        return BPlusTreeRangeIterator {
+            bpm: Arc::clone(&self.bpm),
+            current_page_id: INVALID_PAGE_ID,
+            offset: 0,
+            end_key: end.copied()
+        }
+    }
 }
 
 impl BPlusTreeIndex for BPlusTreeIndexImpl {
@@ -771,7 +777,73 @@ impl BPlusTreeIndex for BPlusTreeIndexImpl {
         start: Option<&BPlusTreeKey>,
         end: Option<&BPlusTreeKey>,
     ) -> BPlusTreeRangeIterator {
-        todo!();
+        let meta_handle = match BufferPoolManager::fetch_page_handle(&self.bpm, self.meta_page_id) {
+            Ok(val)  => val,
+            Err(_) => return self.make_empty_iterator(end)
+        };
+        let meta_page = BPlusTreeMetaPageRef::from(meta_handle);
+        let root_pid = match meta_page.root_page_id() {
+            Some(pid) => pid,
+            None => {
+                return self.make_empty_iterator(end)
+            }
+        };
+
+        let mut cur_handle = match BufferPoolManager::fetch_page_handle(&self.bpm, root_pid) {
+            Ok(val) => val,
+            Err(_) => return self.make_empty_iterator(end)
+        };
+        let leaf_page = {
+            while BPlusTreePageHeader::get_page_type_from_frame_ref(&cur_handle) != BPlusTreePageType::LeafPage {
+                let internal_page = BPlusTreeInternalPageRef::from(cur_handle);
+
+               // loop structure is the same for both but in the None case you always take the left most pid 
+                let child_pid = match start {
+                    Some(val) => {
+                        internal_page.lookup(val, self.comparator.as_ref())
+                    }
+                    None => {
+                        internal_page.pid_array()[0]
+                    }
+                };
+
+                cur_handle = match BufferPoolManager::fetch_page_handle(&self.bpm, child_pid) {
+                    Ok(val) => val,
+                    Err(_) => return self.make_empty_iterator(end)
+                };
+            }
+
+            BPlusTreeLeafPageRef::from(cur_handle)
+        };
+        
+        let offset = match start {
+            Some(val) => {
+                match leaf_page.find_key_index(val, self.comparator.as_ref()) {
+                    Some(idx) => idx,
+                    None => {
+                        // Key doesn't exist - find first key > val
+                        // wanted to use the insert position function but that is private
+                        let size = leaf_page.size();
+                        let mut idx = 0;
+                        while idx < size {
+                            if self.comparator.compare(&leaf_page.key_array()[idx], val) == Ordering::Greater {
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        idx  // Will be size if all keys <= val
+                    }
+                }
+            },
+            None => 0
+        };
+
+        return BPlusTreeRangeIterator {
+            bpm: Arc::clone(&self.bpm),
+            current_page_id: leaf_page.page_id(),
+            offset: offset,
+            end_key: end.copied()
+        }
     }
 }
 
@@ -786,7 +858,42 @@ impl Iterator for BPlusTreeRangeIterator {
     ///
     /// This method internally loads pages as needed using the buffer pool manager.
     fn next(&mut self) -> Option<Self::Item> {
-       todo!();
+       loop {
+            // we'll use this as a sentry to tell us we're at the end of the tree
+            if self.current_page_id == INVALID_PAGE_ID {
+                return None;
+            }
+
+            let handle = match BufferPoolManager::fetch_page_handle(&self.bpm, self.current_page_id) {
+                Ok(handle) => handle,
+                Err(_) => return None,
+            };
+
+            let leaf_page = BPlusTreeLeafPageRef::from(handle);
+
+            // Check if we've reached the end of the current page
+            if self.offset >= leaf_page.size() {
+                self.current_page_id = leaf_page.next_page_id().unwrap_or(INVALID_PAGE_ID);
+                self.offset = 0;
+                continue;  // Go to next iteration to fetch the new page
+            }
+
+            let current_key_idx = self.offset;
+            self.offset += 1;
+
+            let current_key = leaf_page.key_array()[current_key_idx];
+            let current_record_id = leaf_page.rid_array()[current_key_idx];
+
+            // Check if we're past the end boundary
+            if let Some(end) = self.end_key {
+                if current_key > end {
+                    return None;
+                }
+            }
+
+            // Return the current key-value pair
+            return Some((current_key, current_record_id));
+       }
     }
 }
 
